@@ -18,7 +18,6 @@ import { KeyCode, KeyMod } from 'vs/base/common/keyCodes';
 import { Disposable, DisposableStore } from 'vs/base/common/lifecycle';
 import * as env from 'vs/base/common/platform';
 import * as strings from 'vs/base/common/strings';
-import { withNullAsUndefined } from 'vs/base/common/types';
 import { URI } from 'vs/base/common/uri';
 import * as network from 'vs/base/common/network';
 import 'vs/css!./media/searchview';
@@ -263,22 +262,20 @@ export class SearchView extends ViewPane {
 			this._saveSearchHistoryService();
 		}));
 
-		this._register(this.storageService.onDidChangeValue((v) => {
-			if (v.key === SearchHistoryService.SEARCH_HISTORY_KEY) {
-				const restoredHistory = this.searchHistoryService.load();
+		this._register(this.storageService.onDidChangeValue(StorageScope.WORKSPACE, SearchHistoryService.SEARCH_HISTORY_KEY, this._register(new DisposableStore()))(() => {
+			const restoredHistory = this.searchHistoryService.load();
 
-				if (restoredHistory.include) {
-					this.inputPatternIncludes.prependHistory(restoredHistory.include);
-				}
-				if (restoredHistory.exclude) {
-					this.inputPatternExcludes.prependHistory(restoredHistory.exclude);
-				}
-				if (restoredHistory.search) {
-					this.searchWidget.prependSearchHistory(restoredHistory.search);
-				}
-				if (restoredHistory.replace) {
-					this.searchWidget.prependReplaceHistory(restoredHistory.replace);
-				}
+			if (restoredHistory.include) {
+				this.inputPatternIncludes.prependHistory(restoredHistory.include);
+			}
+			if (restoredHistory.exclude) {
+				this.inputPatternExcludes.prependHistory(restoredHistory.exclude);
+			}
+			if (restoredHistory.search) {
+				this.searchWidget.prependSearchHistory(restoredHistory.search);
+			}
+			if (restoredHistory.replace) {
+				this.searchWidget.prependReplaceHistory(restoredHistory.replace);
 			}
 		}));
 	}
@@ -319,6 +316,34 @@ export class SearchView extends ViewPane {
 	private onDidChangeWorkbenchState(): void {
 		if (this.contextService.getWorkbenchState() !== WorkbenchState.EMPTY && this.searchWithoutFolderMessageElement) {
 			dom.hide(this.searchWithoutFolderMessageElement);
+		}
+	}
+
+	private refreshInputs() {
+		this.pauseSearching = true;
+		this.searchWidget.setValue(this.viewModel.searchResult.query?.contentPattern.pattern ?? '');
+		this.searchWidget.setReplaceAllActionState(false);
+		this.searchWidget.toggleReplace(true);
+		this.inputPatternIncludes.setOnlySearchInOpenEditors(this.viewModel.searchResult.query?.onlyOpenEditors || false);
+		this.inputPatternExcludes.setUseExcludesAndIgnoreFiles(!this.viewModel.searchResult.query?.userDisabledExcludesAndIgnoreFiles || true);
+		this.searchIncludePattern.setValue('');
+		this.searchExcludePattern.setValue('');
+		this.pauseSearching = false;
+	}
+
+	public async importSearchResult(searchModel: SearchModel): Promise<void> {
+		// experimental: used by the quick access search to overwrite a search result
+		searchModel.transferSearchResult(this.viewModel);
+
+		this.onSearchResultsChanged();
+		this.refreshInputs();
+
+		const collapseResults = this.searchConfig.collapseResults;
+		if (collapseResults !== 'alwaysCollapse' && this.viewModel.searchResult.matches().length === 1) {
+			const onlyMatch = this.viewModel.searchResult.matches()[0];
+			if (onlyMatch.count() < 50) {
+				this.tree.expand(onlyMatch);
+			}
 		}
 	}
 
@@ -434,7 +459,7 @@ export class SearchView extends ViewPane {
 			this.toggleQueryDetails(true, true, true);
 		}
 
-		this._register(this.viewModel.searchResult.onChange((event) => this.onSearchResultsChanged(event)));
+		this._register(this.viewModel.onSearchResultChanged((event) => this.onSearchResultsChanged(event)));
 
 		this._register(this.onDidChangeBodyVisibility(visible => this.onVisibilityChanged(visible)));
 
@@ -840,7 +865,7 @@ export class SearchView extends ViewPane {
 		this._register(this.tree.onContextMenu(e => this.onContextMenu(e)));
 		const updateHasSomeCollapsible = () => this.toggleCollapseStateDelayer.trigger(() => this.hasSomeCollapsibleResultKey.set(this.hasSomeCollapsible()));
 		updateHasSomeCollapsible();
-		this._register(this.viewModel.searchResult.onChange(() => updateHasSomeCollapsible()));
+		this._register(this.viewModel.onSearchResultChanged(() => updateHasSomeCollapsible()));
 		this._register(this.tree.onDidChangeCollapseState(() => updateHasSomeCollapsible()));
 
 		this._register(Event.debounce(this.tree.onDidOpen, (last, event) => event, DEBOUNCE_DELAY, true)(options => {
@@ -1484,7 +1509,7 @@ export class SearchView extends ViewPane {
 		const options: ITextQueryBuilderOptions = {
 			_reason: 'searchView',
 			extraFileResources: this.instantiationService.invokeFunction(getOutOfWorkspaceEditorResources),
-			maxResults: withNullAsUndefined(this.searchConfig.maxResults),
+			maxResults: this.searchConfig.maxResults ?? undefined,
 			disregardIgnoreFiles: !useExcludesAndIgnoreFiles || undefined,
 			disregardExcludeSettings: !useExcludesAndIgnoreFiles || undefined,
 			onlyOpenEditors: onlySearchInOpenEditors,
@@ -1857,7 +1882,7 @@ export class SearchView extends ViewPane {
 	}
 
 	async open(element: FileMatchOrMatch, preserveFocus?: boolean, sideBySide?: boolean, pinned?: boolean, resourceInput?: URI): Promise<void> {
-		const selection = this.getSelectionFrom(element);
+		const selection = getEditorSelectionFromMatch(element, this.viewModel);
 		const oldParentMatches = element instanceof Match ? element.parent().matches() : [];
 		const resource = resourceInput ?? (element instanceof Match ? element.parent().resource : (<FileMatch>element).resource);
 		let editor: IEditorPane | undefined;
@@ -1950,30 +1975,6 @@ export class SearchView extends ViewPane {
 			}
 			this.viewModel.searchResult.rangeHighlightDecorations.removeHighlightRange();
 		}, errors.onUnexpectedError);
-	}
-
-	private getSelectionFrom(element: FileMatchOrMatch): any {
-		let match: Match | null = null;
-		if (element instanceof Match) {
-			match = element;
-		}
-		if (element instanceof FileMatch && element.count() > 0) {
-			match = element.matches()[element.matches().length - 1];
-		}
-		if (match) {
-			const range = match.range();
-			if (this.viewModel.isReplaceActive() && !!this.viewModel.replaceString) {
-				const replaceString = match.replaceString;
-				return {
-					startLineNumber: range.startLineNumber,
-					startColumn: range.startColumn,
-					endLineNumber: range.startLineNumber,
-					endColumn: range.startColumn + replaceString.length
-				};
-			}
-			return range;
-		}
-		return undefined;
 	}
 
 	private onUntitledDidDispose(resource: URI): void {
@@ -2148,4 +2149,28 @@ class SearchLinkButton extends Disposable {
 			}
 		}));
 	}
+}
+
+export function getEditorSelectionFromMatch(element: FileMatchOrMatch, viewModel: SearchModel): any {
+	let match: Match | null = null;
+	if (element instanceof Match) {
+		match = element;
+	}
+	if (element instanceof FileMatch && element.count() > 0) {
+		match = element.matches()[element.matches().length - 1];
+	}
+	if (match) {
+		const range = match.range();
+		if (viewModel.isReplaceActive() && !!viewModel.replaceString) {
+			const replaceString = match.replaceString;
+			return {
+				startLineNumber: range.startLineNumber,
+				startColumn: range.startColumn,
+				endLineNumber: range.startLineNumber,
+				endColumn: range.startColumn + replaceString.length
+			};
+		}
+		return range;
+	}
+	return undefined;
 }
